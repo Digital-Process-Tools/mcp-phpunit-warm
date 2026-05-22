@@ -74,13 +74,15 @@ Reads MCP JSON-RPC on stdin, writes responses on stdout.
 
 Measured on a real DVSI codebase, single-test invocations:
 
-| Setup | Per call (warm) | Per call (cold) |
-|-------|-----------------|-----------------|
-| Cold `vendor/bin/phpunit` | — | ~1600ms |
-| **mcp-phpunit-warm v0.2 (warm)** | **~300ms** | ~1400ms (first call) |
-| mcp-phpunit-warm v0.1 (warm) | ~1800ms | ~1400ms |
+| Setup | Per call (steady-state) |
+|-------|--------------------------|
+| `vendor/bin/phpunit` (fresh CLI each call) | ~1600ms |
+| mcp-phpunit-warm **v0.1** (daemon warm) | ~1800ms |
+| mcp-phpunit-warm **v0.2** (daemon warm) | **~300ms** |
 
-v0.2 win comes from in-memory results via `EventFacade` subscribers — drops the JUnit XML write + read + parse round-trip (~200ms) and side-steps PHPUnit's per-call printer setup.
+First call into a fresh daemon pays the boot once (~1400ms). All subsequent calls reuse the warm autoloader and singletons.
+
+The v0.2 leap came from replacing the JUnit XML round-trip with in-memory `EventFacade` subscribers — drops the temp file write + read + parse (~200ms) and side-steps PHPUnit's per-call printer setup.
 
 The win is cold-start amortization: autoloader bootstrap, XML config parsing, and test suite construction happen once. Subsequent calls skip all of it. Smaller win than [mcp-rector-warm](https://github.com/Digital-Process-Tools/mcp-rector-warm) (~14× per edit) because PHPUnit cold is already faster than Rector cold.
 
