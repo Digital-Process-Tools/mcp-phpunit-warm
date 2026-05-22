@@ -1,11 +1,13 @@
 <p align="center">
-  <img src="banner.png" alt="mcp-phpunit-warm — every test warm. ~4× faster per call." width="900">
+  <img src="banner.png" alt="mcp-phpunit-warm — every test warm. ~6× faster per call." width="900">
 </p>
 
 # mcp-phpunit-warm
 
 > **Stop paying PHPUnit's bootstrap tax on every test call.**
-> A warm-process [MCP](https://modelcontextprotocol.io/) server that keeps [PHPUnit](https://phpunit.de/) bootstrapped across calls. **~4× faster per call** vs cold CLI. Works with every MCP client.
+> A warm-process [MCP](https://modelcontextprotocol.io/) server that keeps [PHPUnit](https://phpunit.de/) bootstrapped across calls. **~6× faster per call** vs cold CLI. Works with every MCP client.
+>
+> **v0.2.0:** results captured in-memory via `EventFacade` subscribers — no more JUnit XML round-trip.
 
 [![Tests](https://github.com/Digital-Process-Tools/mcp-phpunit-warm/actions/workflows/tests.yml/badge.svg)](https://github.com/Digital-Process-Tools/mcp-phpunit-warm/actions/workflows/tests.yml)
 [![Packagist](https://img.shields.io/packagist/v/dpt/mcp-phpunit-warm.svg)](https://packagist.org/packages/dpt/mcp-phpunit-warm)
@@ -75,15 +77,10 @@ Measured on a real DVSI codebase, single-test invocations:
 | Setup | Per call (warm) | Per call (cold) |
 |-------|-----------------|-----------------|
 | Cold `vendor/bin/phpunit` | — | ~1600ms |
-| **mcp-phpunit-warm (warm)** | **~350ms** | ~1400ms (first call) |
+| **mcp-phpunit-warm v0.2 (warm)** | **~300ms** | ~1400ms (first call) |
+| mcp-phpunit-warm v0.1 (warm) | ~1800ms | ~1400ms |
 
-Batch behaviour:
-
-| Calls | Cold | Warm | Speedup |
-|-------|------|------|---------|
-| 3 | 4.77s | 2.07s | **2.3×** |
-| 10 | 15.9s | 4.9s | **3.2×** |
-| 100 | 159s | 36s | **4.4×** |
+v0.2 win comes from in-memory results via `EventFacade` subscribers — drops the JUnit XML write + read + parse round-trip (~200ms) and side-steps PHPUnit's per-call printer setup.
 
 The win is cold-start amortization: autoloader bootstrap, XML config parsing, and test suite construction happen once. Subsequent calls skip all of it. Smaller win than [mcp-rector-warm](https://github.com/Digital-Process-Tools/mcp-rector-warm) (~14× per edit) because PHPUnit cold is already faster than Rector cold.
 
@@ -121,14 +118,14 @@ Returns:
 ```json
 {
   "exit_code": 0,
-  "output": "<?xml version=\"1.0\"...JUnit XML...",
+  "output": "{\"tests\":3,\"assertions\":5,\"failures\":[],\"errors\":[],\"skipped\":[],\"time\":0.012}",
   "warm_boot": true
 }
 ```
 
 `warm_boot: true` ⇒ autoloader reused. `false` ⇒ first call (cold boot just finished).
 
-`output` contains JUnit XML — parseable by any CI tool or agent that understands test results.
+`output` is a JSON string with `{tests, assertions, failures: [{class, method, file, line, message}], errors: […], skipped: […], time}`. Captured in-process via `PHPUnit\Event\Facade` subscribers — no temp file, no XML parse.
 
 ## How it works
 
@@ -138,15 +135,17 @@ Three decisions worth knowing:
 
 2. **Static singleton reset between calls.** PHPUnit 10/11/12 uses sealed singletons (`EventFacade`, `Registry`, `OutputFacade`, `CodeCoverage`) that are reset via Reflection before each run. This lets `Application::run()` be called repeatedly in the same process without hitting `EventFacadeIsSealedException`.
 
-3. **stdout isolation via `--no-output` + JUnit temp file.** PHPUnit's `DefaultPrinter` writes to `php://stdout` using `fwrite()`, which bypasses PHP's output buffer and would corrupt the MCP stdio transport. `--no-output` forces `NullPrinter` (no stdout writes). Results are captured via `--log-junit` to a temp file and returned in the response.
+3. **In-memory results via `EventFacade` subscribers.** PHPUnit's `DefaultPrinter` writes to `php://stdout` using `fwrite()`, which bypasses PHP's output buffer and would corrupt the MCP stdio transport. We force `--no-output` to silence the printer, then register subscribers on `PHPUnit\Event\Facade` (`PreparedSubscriber`, `FailedSubscriber`, `ErroredSubscriber`, …) that collect results in memory during the run. No temp file. No XML round-trip.
 
 ## FAQ
 
 **Does this replace `vendor/bin/phpunit`?** No. Use it from MCP clients (Claude Desktop, agents). For one-off CLI runs the regular binary is simpler.
 
-**Why JUnit XML in the output field?** It's structured, parseable, and contains everything: test names, failures, errors, timing. An agent can read it directly. A future version may add a `--output-format` argument.
+**Why JSON output instead of JUnit XML?** v0.1 used JUnit XML via `--log-junit` to a temp file. v0.2 captures results in-memory via `EventFacade` subscribers and serializes to JSON — no file I/O, no XML parse, smaller payload. The shape mirrors what JUnit XML had, just easier for agents to consume.
 
 **Does it support `--filter`?** Yes — pass `filter: "testMyMethod"` as an argument to the tool.
+
+**`--prewarm` flag?** Opt-in (off by default). When enabled, runs `--list-tests` at daemon startup to trigger the project's `phpunit.xml` bootstrap so the first real call is already warm. **Caveat:** projects with large test suites dump thousands of test names to `php://stdout`, which bypasses `ob_start` and corrupts the MCP stdio transport. Only enable if your project's `--list-tests` output is small.
 
 **Memory?** The daemon sets `memory_limit = -1`. Idle daemon ≈ 30–60 MB resident depending on project bootstrap.
 
