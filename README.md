@@ -77,12 +77,11 @@ Measured on a real DVSI codebase, single-test invocations:
 | Setup | Per call (steady-state) |
 |-------|--------------------------|
 | `vendor/bin/phpunit` (fresh CLI each call) | ~1600ms |
-| mcp-phpunit-warm **v0.1** (daemon warm) | ~1800ms |
-| mcp-phpunit-warm **v0.2** (daemon warm) | **~300ms** |
+| **mcp-phpunit-warm (daemon warm)** | **~300ms** |
 
 First call into a fresh daemon pays the boot once (~1400ms). All subsequent calls reuse the warm autoloader and singletons.
 
-The v0.2 leap came from replacing the JUnit XML round-trip with in-memory `EventFacade` subscribers — drops the temp file write + read + parse (~200ms) and side-steps PHPUnit's per-call printer setup.
+Results are captured in-memory via `PHPUnit\Event\Facade` subscribers — no JUnit XML temp file, no per-call printer setup.
 
 The win is cold-start amortization: autoloader bootstrap, XML config parsing, and test suite construction happen once. Subsequent calls skip all of it. Smaller win than [mcp-rector-warm](https://github.com/Digital-Process-Tools/mcp-rector-warm) (~14× per edit) because PHPUnit cold is already faster than Rector cold.
 
