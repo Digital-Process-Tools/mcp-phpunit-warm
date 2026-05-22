@@ -12,7 +12,7 @@ final class PhpunitTool
 
     public function __construct(?PhpunitRunner $runner = null)
     {
-        $this->runner = $runner ?? new PhpunitRunner();
+        $this->runner = $runner ?? PhpunitRunner::instance();
     }
 
     /**

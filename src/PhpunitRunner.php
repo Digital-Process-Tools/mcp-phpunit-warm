@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Dpt\McpPhpunitWarm;
 
+use PHPUnit\Event\Facade as EventFacade;
 use PHPUnit\TextUI\Application;
 
 /**
@@ -13,12 +14,38 @@ use PHPUnit\TextUI\Application;
  * that are sealed after the first run. We reset them via Reflection between calls.
  * The autoloader stays warm — class files are already parsed and opcode-cached.
  *
- * Output is captured via --log-junit to a temp file + --no-output to prevent PHPUnit's
- * DefaultPrinter from writing to php://stdout (which would corrupt the MCP stdio transport).
+ * Results are collected in-memory via InMemorySubscriber registered on the EventFacade
+ * before each run. No temp file round-trip; no --log-junit overhead.
  */
 final class PhpunitRunner
 {
+    private static ?self $shared = null;
+
     private bool $warm = false;
+    private InMemorySubscriber $subscriber;
+
+    public function __construct()
+    {
+        $this->subscriber = new InMemorySubscriber();
+    }
+
+    /**
+     * Shared instance used by PhpunitTool when the bin script pre-warms.
+     * The bin script calls setShared() after prewarm(); PhpunitTool calls instance().
+     */
+    public static function setShared(self $runner): void
+    {
+        self::$shared = $runner;
+    }
+
+    public static function instance(): self
+    {
+        if (self::$shared === null) {
+            self::$shared = new self();
+        }
+
+        return self::$shared;
+    }
 
     public function isWarm(): bool
     {
@@ -26,7 +53,39 @@ final class PhpunitRunner
     }
 
     /**
-     * Run PHPUnit. Returns exit code, junit XML output, and warm_boot flag.
+     * Optionally pre-warm the PHPUnit bootstrap by running a no-op discovery pass.
+     *
+     * Calling this once at daemon startup pays the bootstrap cost before the first
+     * real test call arrives, so warm calls benefit from a pre-loaded framework.
+     *
+     * @param list<string> $baseArgv Base phpunit argv (binary name + optional --configuration).
+     */
+    public function prewarm(array $baseArgv): void
+    {
+        if ($this->warm) {
+            return;
+        }
+
+        // --list-tests triggers bootstrap + autoload without running any test.
+        $argv = array_merge($baseArgv, ['--list-tests', '--no-output', '--no-coverage']);
+
+        ob_start();
+        try {
+            $app = new Application();
+            $app->run($argv);
+        } catch (\Throwable) {
+            // Ignore: list-tests may exit non-zero if no tests match yet — that's fine.
+        } finally {
+            ob_end_clean();
+        }
+
+        // Reset singletons so the first real run starts clean, but keep $warm = false
+        // so the caller still gets warm_boot = false on the first real call.
+        $this->resetStaticSingletons();
+    }
+
+    /**
+     * Run PHPUnit. Returns exit code, structured JSON output, and warm_boot flag.
      *
      * @param list<string> $argv PHPUnit CLI args including binary name as $argv[0].
      *   E.g. ['phpunit', '--configuration', '/path/phpunit.xml', 'tests/FooTest.php']
@@ -40,43 +99,39 @@ final class PhpunitRunner
             $this->resetStaticSingletons();
         }
 
-        $junitFile = tempnam(sys_get_temp_dir(), 'phpunit_mcp_');
+        $this->subscriber->reset();
+
+        // Register in-memory subscribers before Application::run() seals the EventFacade.
+        foreach ($this->subscriber->subscribers() as $sub) {
+            EventFacade::instance()->registerSubscriber($sub);
+        }
 
         // --no-output: forces NullPrinter so DefaultPrinter never writes to php://stdout.
         // --no-coverage: skip coverage collection (expensive, not useful per MCP call).
-        // --log-junit: structured results captured to temp file, read back as output.
-        $fullArgv = array_merge($argv, [
-            '--no-output',
-            '--no-coverage',
-            '--log-junit', $junitFile,
-        ]);
+        // No --log-junit: results captured in-memory by InMemorySubscriber.
+        $fullArgv = array_merge($argv, ['--no-output', '--no-coverage']);
 
         // ob_start captures any print/echo from Application internals (e.g. crash messages).
         ob_start();
         try {
-            $app = new Application();
+            $app      = new Application();
             $exitCode = $app->run($fullArgv);
         } finally {
             $echoed = ob_get_clean();
         }
 
-        $junitXml = '';
-        if (is_file($junitFile)) {
-            $junitXml = (string) file_get_contents($junitFile);
-            @unlink($junitFile);
-        }
+        $result = $this->subscriber->result();
 
-        // Combine junit XML with any internal echo output (crash messages etc.)
-        $output = $junitXml;
+        // Append any internal echo output (crash messages, fatal errors) as a note.
         if (is_string($echoed) && $echoed !== '') {
-            $output = $output !== '' ? $output . "\n" . $echoed : $echoed;
+            $result['echo'] = $echoed;
         }
 
         $this->warm = true;
 
         return [
             'exit_code' => $exitCode,
-            'output'    => $output,
+            'output'    => json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             'warm_boot' => $warmBoot,
         ];
     }
