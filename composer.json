@@ -1,0 +1,28 @@
+{
+    "name": "dpt/mcp-phpunit-warm",
+    "description": "Warm-process MCP server for PHPUnit. Keeps the test framework bootstrapped across calls — faster per-suite invocation vs cold CLI. Compatible with any MCP client (Claude Desktop, Cline, Continue, Zed, custom).",
+    "type": "project",
+    "license": "proprietary",
+    "keywords": ["mcp", "model-context-protocol", "phpunit", "php", "testing", "claude", "ai-tools"],
+    "homepage": "https://github.com/Digital-Process-Tools/mcp-phpunit-warm",
+    "require": {
+        "php": ">=8.2",
+        "mcp/sdk": "^0.5",
+        "phpunit/phpunit": "^10 || ^11 || ^12",
+        "symfony/finder": "^7.4"
+    },
+    "autoload": {
+        "psr-4": {
+            "Dpt\\McpPhpunitWarm\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Dpt\\McpPhpunitWarm\\Tests\\": "tests/"
+        }
+    },
+    "bin": ["bin/mcp-phpunit-warm"],
+    "config": {
+        "sort-packages": true
+    }
+}
