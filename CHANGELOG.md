@@ -6,6 +6,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-23
+
+### Security
+
+- **Path containment on `phpunit_run`.** PHPUnit autoloads + executes the supplied `$testFile` in-process. Previously any path was accepted, giving a hostile MCP client full RCE in the daemon's identity by pointing at arbitrary `*.php` files. `PhpunitTool::run()` now realpath-canonicalises `$testFile` against `realpath(getcwd())` (pinned at boot via `--working-dir`) and returns a `SecurityError` before PHPUnit boots. `$testFile = null` (full-suite run) is unaffected.
+
+### Added
+
+- Unit tests `PhpunitToolContainmentTest::testRejectsTestFileOutsideWorkingDir` + `testAcceptsNullTestFile`.
+
 ## [0.2.0] — 2026-05-22
 
 ### Added

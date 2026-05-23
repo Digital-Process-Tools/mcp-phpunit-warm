@@ -32,6 +32,25 @@ final class PhpunitTool
     ): array {
         $config = getenv('MCP_PHPUNIT_CONFIG') ?: null;
 
+        // Containment: phpunit autoloads + executes the supplied file in-process.
+        // A hostile MCP client must NOT be able to point this at arbitrary PHP
+        // files on the host (full RCE in the daemon's identity). Constrain to
+        // realpath(cwd) — set at boot via --working-dir.
+        if ($testFile !== null) {
+            $cwd = realpath(getcwd() ?: '.');
+            $real = realpath($testFile);
+            if ($cwd === false || $real === false || ($real !== $cwd && !str_starts_with($real, $cwd . DIRECTORY_SEPARATOR))) {
+                return [
+                    'exit_code'   => -1,
+                    'output'      => '',
+                    'warm_boot'   => $this->runner->isWarm(),
+                    'error'       => 'phpunit_run: testFile is outside the configured working directory.',
+                    'error_class' => 'SecurityError',
+                    'trace'       => '',
+                ];
+            }
+        }
+
         $argv = ['phpunit'];
 
         if ($config !== null) {
