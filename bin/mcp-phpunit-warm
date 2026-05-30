@@ -22,10 +22,12 @@ use Mcp\Server\Transport\StdioTransport;
 // Parse our own CLI flags BEFORE loading phpunit — keeps Server lean.
 $workingDir = null;
 $config     = null;
-// Prewarm is opt-in: PHPUnit's --list-tests writes via php://stdout (bypasses ob_start)
-// which corrupts MCP stdio transport on projects with large test suites. Enable with --prewarm
-// only when you've verified your test framework doesn't dump to stdout during list-tests.
-$prewarm    = false;
+// Prewarm is ON by default: PhpunitRunner::prewarm() now runs a single bundled probe
+// test through the project's config under --no-output. It boots the framework + the
+// phpunit.xml bootstrap (so forked test calls inherit a warm autoloader via copy-on-write)
+// WITHOUT dumping to php://stdout — unlike the old --list-tests prewarm that corrupted the
+// MCP stdio transport. Disable with --no-prewarm (e.g. for fast test startup).
+$prewarm    = true;
 
 foreach (array_slice($argv, 1) as $arg) {
     if (str_starts_with($arg, '--working-dir=')) {
@@ -53,8 +55,9 @@ if ($config !== null) {
     putenv('MCP_PHPUNIT_CONFIG=' . $config);
 }
 
-// Pre-warm: run --list-tests once at daemon startup to trigger phpunit.xml bootstrap
-// and autoload. Individual test calls then skip the framework boot cost (~800ms saved).
+// Pre-warm: boot the framework + phpunit.xml bootstrap once at daemon startup via a
+// throwaway probe test. Forked test calls then inherit the warm autoloader via
+// copy-on-write and skip the framework boot cost (~800ms saved).
 $runner = new PhpunitRunner();
 
 if ($prewarm) {
@@ -69,7 +72,7 @@ if ($prewarm) {
 PhpunitRunner::setShared($runner);
 
 $server = Server::builder()
-    ->setServerInfo('mcp-phpunit-warm', '0.3.0')
+    ->setServerInfo('mcp-phpunit-warm', '0.4.0')
     ->setDiscovery(dirname(__DIR__), ['src'])
     ->build();
 
