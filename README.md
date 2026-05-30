@@ -7,6 +7,8 @@
 > **Stop paying PHPUnit's bootstrap tax on every test call.**
 > A warm-process [MCP](https://modelcontextprotocol.io/) server that keeps [PHPUnit](https://phpunit.de/) bootstrapped across calls. **~6× faster per call** vs cold CLI. Works with every MCP client.
 >
+> **v0.4.0:** each test run executes in a short-lived **forked child**, so an edit made between calls is always picked up — no more stale results from a class the warm process loaded earlier. The framework stays warm; only your code is re-read.
+>
 > **v0.2.0:** results captured in-memory via `EventFacade` subscribers — no more JUnit XML round-trip.
 
 [![Tests](https://github.com/Digital-Process-Tools/mcp-phpunit-warm/actions/workflows/tests.yml/badge.svg)](https://github.com/Digital-Process-Tools/mcp-phpunit-warm/actions/workflows/tests.yml)
@@ -24,7 +26,7 @@
 
 Every `phpunit` invocation pays the same toll: autoloader bootstrap, XML config parsing, test suite construction, extension bootstrapping. For agents and validators that run PHPUnit after every edit or after every MCP tool call, that cold-start cost adds up fast.
 
-`mcp-phpunit-warm` runs PHPUnit inside a long-lived PHP process. **First call pays the boot once. Every subsequent call reuses the warm autoloader and skips re-parsing.**
+`mcp-phpunit-warm` keeps a long-lived PHP process with PHPUnit already bootstrapped. **The boot is paid once; every call inherits that warm framework via a fork and skips re-parsing it.** Your own source and test classes are re-read on each call (in the forked child) so an edit is never missed — you get the boot savings without the staleness.
 
 ## Install
 
@@ -124,19 +126,21 @@ Returns:
 }
 ```
 
-`warm_boot: true` ⇒ autoloader reused. `false` ⇒ first call (cold boot just finished).
+`warm_boot: true` ⇒ a previous run already warmed this daemon (the forked child inherits the warm framework). `false` ⇒ first call on this daemon.
 
 `output` is a JSON string with `{tests, assertions, failures: [{class, method, file, line, message}], errors: […], skipped: […], time}`. Captured in-process via `PHPUnit\Event\Facade` subscribers — no temp file, no XML parse.
 
 ## How it works
 
-Three decisions worth knowing:
+Four decisions worth knowing:
 
-1. **One daemon per project, not per call.** Config + working dir pin at server startup via `--config` and `--working-dir`. The autoloader stays loaded across every call.
+1. **One daemon per project, not per call.** Config + working dir pin at server startup via `--config` and `--working-dir`. The PHPUnit framework stays bootstrapped for the daemon's whole life.
 
-2. **Static singleton reset between calls.** PHPUnit 10/11/12 uses sealed singletons (`EventFacade`, `Registry`, `OutputFacade`, `CodeCoverage`) that are reset via Reflection before each run. This lets `Application::run()` be called repeatedly in the same process without hitting `EventFacadeIsSealedException`.
+2. **Fork per call — warm framework, fresh code.** A long-lived PHP process can never reload a class once it's autoloaded (PHP forbids redeclaration), so an in-process warm runner would keep executing the *first* version of every class it ever loaded and silently ignore your edits. Instead, the daemon parent boots only the framework and *never loads a user source/test class*; each `phpunit_run` **forks a child** that autoloads your classes fresh from disk, runs them, ships the result back over a socket, and dies. The child inherits the parent's compiled framework via copy-on-write (warm) yet sees the current code every time (fresh). The child `SIGKILL`s itself once its result is on the wire so no teardown hook can write to the parent's stdio channel. On a platform without `pcntl` the daemon falls back to in-process execution (warm but stale-after-edit).
 
-3. **In-memory results via `EventFacade` subscribers.** PHPUnit's `DefaultPrinter` writes to `php://stdout` using `fwrite()`, which bypasses PHP's output buffer and would corrupt the MCP stdio transport. We force `--no-output` to silence the printer, then register subscribers on `PHPUnit\Event\Facade` (`PreparedSubscriber`, `FailedSubscriber`, `ErroredSubscriber`, …) that collect results in memory during the run. No temp file. No XML round-trip.
+3. **Static singleton reset before each run.** PHPUnit 10/11/12 uses sealed singletons (`EventFacade`, `Registry`, `OutputFacade`, `CodeCoverage`) that are reset via Reflection before a run, so `Application::run()` can be invoked without hitting `EventFacadeIsSealedException` — needed in the prewarm probe and the fork-less fallback.
+
+4. **In-memory results via `EventFacade` subscribers.** PHPUnit's `DefaultPrinter` writes to `php://stdout` using `fwrite()`, which bypasses PHP's output buffer and would corrupt the MCP stdio transport. We force `--no-output` to silence the printer, then register subscribers on `PHPUnit\Event\Facade` (`PreparedSubscriber`, `FailedSubscriber`, `ErroredSubscriber`, …) that collect results in memory during the run. No temp file. No XML round-trip.
 
 ## FAQ
 
@@ -146,7 +150,11 @@ Three decisions worth knowing:
 
 **Does it support `--filter`?** Yes — pass `filter: "testMyMethod"` as an argument to the tool.
 
-**`--prewarm` flag?** Opt-in (off by default). When enabled, runs `--list-tests` at daemon startup to trigger the project's `phpunit.xml` bootstrap so the first real call is already warm. **Caveat:** projects with large test suites dump thousands of test names to `php://stdout`, which bypasses `ob_start` and corrupts the MCP stdio transport. Only enable if your project's `--list-tests` output is small.
+**Do I lose the warm speedup if every call forks?** No. The fork is cheap (copy-on-write) and the child inherits the parent's already-compiled PHPUnit framework, so it skips the framework boot. The only per-call cost is re-reading *your* source/test classes — which is exactly what makes the result trustworthy after an edit.
+
+**What if I edit a file between two calls?** The next call sees it. Each run executes in a fresh forked child that autoloads your classes from disk, so there's no stale-class problem (the bug that motivated v0.4.0: [claude-supertool#265](https://github.com/Digital-Process-Tools/claude-supertool/issues/265)). **One caveat:** classes loaded by your `phpunit.xml` *bootstrap* itself (e.g. a bootstrap that eagerly `require`s application classes) are loaded into the long-lived parent and inherited by every forked child — so edits to *those* specific classes won't be picked up until the daemon restarts. Lazy autoloaders (the common case) are unaffected; keep heavy eager-loading out of the bootstrap.
+
+**`--prewarm` flag?** On by default now. At startup the daemon runs a single bundled throwaway probe test through your config under `--no-output` — that fires the `phpunit.xml` bootstrap and loads the framework (which forked calls then inherit) **without** loading any of your classes and without dumping to `php://stdout`. The old `--list-tests` prewarm was opt-in precisely because large suites flooded stdout and corrupted the MCP transport; the probe avoids that. Disable with `--no-prewarm`.
 
 **Memory?** The daemon sets `memory_limit = -1`. Idle daemon ≈ 30–60 MB resident depending on project bootstrap.
 
