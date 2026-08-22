@@ -104,7 +104,7 @@ final class ServerStdioTest extends TestCase
         self::assertSame(1, $responses[0]['id']);
         self::assertArrayHasKey('result', $responses[0]);
         self::assertSame('mcp-phpunit-warm', $responses[0]['result']['serverInfo']['name']);
-        self::assertSame('0.4.0', $responses[0]['result']['serverInfo']['version']);
+        self::assertSame('0.4.1', $responses[0]['result']['serverInfo']['version']);
 
         // tools/list response
         self::assertSame(2, $responses[1]['id']);

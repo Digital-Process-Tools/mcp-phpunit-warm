@@ -6,6 +6,8 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-08-22
+
 ### Fixed
 
 - **Child output no longer reaches the MCP transport (#3).** The forked test child inherits stdout, which for this server *is* the protocol stream. `runInProcess()` buffered PHPUnit's own output, but a test that fatals or calls `exit()` never reaches the matching `ob_get_clean()` — PHP flushes every active buffer during shutdown, straight to fd 1. Whatever user code had printed then landed in front of the next JSON-RPC frame and, being unterminated, glued itself to it (`</html>{"jsonrpc":...}`). Clients that frame on newlines could not parse that line and blocked until their own timeout on a result that had already arrived — measured at five minutes per call against a host application that renders an HTML error page on fatals. The child now seals stdout immediately after the fork with a never-ended output buffer whose callback returns nothing, so output from any phase, shutdown included, writes zero bytes. Results are unaffected: the child ships them over its socket pair.

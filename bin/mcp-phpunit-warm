@@ -72,7 +72,7 @@ if ($prewarm) {
 PhpunitRunner::setShared($runner);
 
 $server = Server::builder()
-    ->setServerInfo('mcp-phpunit-warm', '0.4.0')
+    ->setServerInfo('mcp-phpunit-warm', '0.4.1')
     ->setDiscovery(dirname(__DIR__), ['src'])
     ->build();
 
