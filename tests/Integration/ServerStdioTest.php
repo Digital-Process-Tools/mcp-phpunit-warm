@@ -12,18 +12,50 @@ use PHPUnit\Framework\TestCase;
  */
 final class ServerStdioTest extends TestCase
 {
+    /** Printed by the child in the #3 fixture; must never appear on the transport. */
+    private const CHILD_MARKER = '<!DOCTYPE html>';
+
     private static string $bin;
     private static string $fixtureDir;
 
     /** @var list<string> temp project dirs created per test, removed in tearDown */
     private array $tmpDirs = [];
 
+    /** @var list<string> every byte each spawned server wrote to stdout this test */
+    private array $transcripts = [];
+
     protected function tearDown(): void
     {
+        // Checked for every test rather than only the one that targets it (#3):
+        // a leak is a property of the transport, so the suite should fail wherever
+        // it appears, not only where someone thought to look for it.
+        foreach ($this->transcripts as $transcript) {
+            $this->assertTransportCarriesOnlyFrames($transcript);
+        }
+        $this->transcripts = [];
+
         foreach ($this->tmpDirs as $dir) {
             $this->removeDir($dir);
         }
         $this->tmpDirs = [];
+    }
+
+    /**
+     * Every non-empty line the server wrote must be a JSON-RPC frame and nothing
+     * else. Anything a client cannot parse belongs nowhere near this stream.
+     */
+    private function assertTransportCarriesOnlyFrames(string $transcript): void
+    {
+        foreach (explode("\n", trim($transcript)) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            self::assertIsArray(
+                json_decode($line, true),
+                'every line on the transport must be a JSON-RPC frame, got: ' . substr($line, 0, 200),
+            );
+        }
     }
 
     private function removeDir(string $dir): void
@@ -235,6 +267,164 @@ final class ServerStdioTest extends TestCase
     }
 
     /**
+     * Regression for #3: nothing the forked child prints may reach stdout.
+     *
+     * stdout IS the MCP transport. A test that echoes and then dies leaves PHP's
+     * shutdown path to flush every active output buffer to fd 1, so the echoed
+     * bytes land in front of the next protocol frame and glue themselves to it:
+     * `</html>{"jsonrpc":...}`. A client that frames on newlines cannot parse
+     * that line and waits out its entire timeout on an answer it already holds.
+     * Measured against a host application that renders an HTML error page on
+     * fatals: 45KB of it in the stream, and five minutes per call for a verdict
+     * the server had produced in two seconds.
+     *
+     * The assertion is deliberately about the transport rather than about the
+     * response: a fix that merely reordered the frames would still leave a
+     * client parsing HTML.
+     */
+    public function testChildOutputNeverReachesTheProtocolStream(): void
+    {
+        $project = $this->makeEchoingCrashProject();
+
+        $stdout = $this->rawStdout($project, [
+            ['jsonrpc' => '2.0', 'id' => 1, 'method' => 'initialize', 'params' => [
+                'protocolVersion' => '2024-11-05',
+                'capabilities'    => new \stdClass(),
+                'clientInfo'      => ['name' => 'phpunit', 'version' => '1.0.0'],
+            ]],
+            ['jsonrpc' => '2.0', 'method' => 'notifications/initialized'],
+            $this->runCall(2),
+        ]);
+
+        // Deliberately NOT a substring check for the marker: once the child's output
+        // is reported rather than discarded, the marker travels inside the frame as
+        // data, which is the whole point. What must never happen is the marker
+        // reaching the stream as bytes of its own -- and that is exactly what frame
+        // purity states. Before the fix this failed on
+        // `<!DOCTYPE html>...</html>{"jsonrpc":...}`, which decodes as nothing.
+        $this->assertTransportCarriesOnlyFrames($stdout);
+
+        // Sealed, not swallowed: the crash still has to be reported, and what the
+        // child printed on its way down is the most useful thing in the report.
+        $call = $this->frame($stdout, 2);
+        $output = json_decode($call['result']['structuredContent']['output'] ?? '', true);
+        self::assertIsArray($output, 'crash must still produce a result payload');
+
+        self::assertStringContainsString(
+            self::CHILD_MARKER,
+            $output['echo'] ?? '',
+            'output printed by the dying child must be reported in the result',
+        );
+        self::assertStringContainsString(
+            'died before shipping a result',
+            $output['errors'][0]['message'] ?? '',
+            'the result must say the child died rather than report an empty run',
+        );
+    }
+
+    /**
+     * The frame with $id, parsed out of a raw transcript.
+     *
+     * @return array<string,mixed>
+     */
+    private function frame(string $transcript, int $id): array
+    {
+        foreach (explode("\n", $transcript) as $line) {
+            $line = trim($line);
+            if ($line === '' || $line[0] !== '{') {
+                continue;
+            }
+            $decoded = json_decode($line, true);
+            if (is_array($decoded) && ($decoded['id'] ?? null) === $id) {
+                return $decoded;
+            }
+        }
+
+        self::fail("no frame for id={$id} in: " . substr($transcript, 0, 500));
+    }
+
+    /**
+     * A project whose only test echoes and then ends the process, reproducing
+     * both halves of #3 at once: output produced by user code, and a child that
+     * dies before it can ship its result.
+     */
+    private function makeEchoingCrashProject(): string
+    {
+        $dir = sys_get_temp_dir() . '/phpunit_mcp_leak_' . bin2hex(random_bytes(6));
+        mkdir($dir . '/tests', 0777, true);
+        $this->tmpDirs[] = $dir;
+
+        $marker = self::CHILD_MARKER;
+        file_put_contents($dir . '/tests/EchoingCrashTest.php', <<<PHP
+            <?php
+
+            declare(strict_types=1);
+
+            use PHPUnit\\Framework\\TestCase;
+
+            final class EchoingCrashTest extends TestCase
+            {
+                public function testEchoesThenDies(): void
+                {
+                    echo '{$marker}<html><body>error page</body></html>';
+                    exit(1);
+                }
+            }
+            PHP);
+        file_put_contents($dir . '/phpunit.xml', <<<XML
+            <?xml version="1.0" encoding="UTF-8"?>
+            <phpunit colors="false" failOnRisky="false" failOnWarning="false">
+                <testsuites>
+                    <testsuite name="leak">
+                        <directory>tests</directory>
+                    </testsuite>
+                </testsuites>
+            </phpunit>
+            XML);
+
+        return $dir;
+    }
+
+    /**
+     * The server's stdout verbatim — unfiltered, because the filtering is what
+     * this test exists to check.
+     *
+     * @param list<array<string,mixed>> $messages
+     */
+    private function rawStdout(string $project, array $messages): string
+    {
+        $cmd = [
+            self::$bin,
+            '--no-prewarm',
+            '--working-dir=' . $project,
+            '--config=' . $project . '/phpunit.xml',
+        ];
+
+        $stdin = '';
+        foreach ($messages as $message) {
+            $stdin .= json_encode($message) . "\n";
+        }
+
+        $proc = proc_open(
+            $cmd,
+            [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
+            $pipes,
+        );
+        self::assertIsResource($proc);
+        fwrite($pipes[0], $stdin);
+        fclose($pipes[0]);
+        $stdout = stream_get_contents($pipes[1]) ?: '';
+        stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($proc);
+
+        $this->transcripts[] = $stdout;
+
+        return $stdout;
+    }
+
+    /**
      * @return array{handle: resource, stdin: resource, stdout: resource, stderr: string}
      */
     private function spawnServer(string $project): array
@@ -384,6 +574,8 @@ final class ServerStdioTest extends TestCase
         fclose($pipes[1]);
         fclose($pipes[2]);
         proc_close($proc);
+
+        $this->transcripts[] = $stdout;
 
         $responses = [];
         foreach (explode("\n", $stdout) as $line) {
