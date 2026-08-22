@@ -39,6 +39,13 @@ final class PhpunitRunner
 
     private static ?self $shared = null;
 
+    /**
+     * Set in the forked child once its result is on the wire, so the shutdown hook
+     * installed by {@see sealChildStdout()} does not ship a second, contradictory
+     * payload behind it.
+     */
+    private static bool $childResultSent = false;
+
     private bool $warm = false;
     private InMemorySubscriber $subscriber;
 
@@ -140,6 +147,7 @@ final class PhpunitRunner
         if ($pid === 0) {
             // ---- CHILD ----
             fclose($parentSock);
+            self::sealChildStdout($childSock);
 
             try {
                 $payload = $this->runInProcess($argv);
@@ -153,6 +161,7 @@ final class PhpunitRunner
             $json = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
             fwrite($childSock, (string) $json);
             fflush($childSock);
+            self::$childResultSent = true;
             fclose($childSock);
 
             $this->terminateChild();
@@ -207,6 +216,82 @@ final class PhpunitRunner
         $payload['warm_boot'] = $warmBoot;
 
         return $payload;
+    }
+
+    /**
+     * Make the forked child incapable of reaching stdout, and give whatever it
+     * printed somewhere better to go.
+     *
+     * stdout is the MCP transport. The child inherits it across the fork, so every
+     * byte user code prints lands in the parent's protocol stream -- in front of
+     * the next frame, and glued to it when the print is unterminated:
+     * `</html>{"jsonrpc":...}`. A client that frames on newlines cannot parse that
+     * line, so it blocks until its own timeout on a result that already arrived.
+     * Five minutes per call, and no verdict, for a run that took two seconds (#3).
+     *
+     * `runInProcess()` already wraps Application::run in ob_start, but a buffer is
+     * only as good as its ending: a test that fatals or calls exit() never reaches
+     * the matching ob_get_clean(), and PHP flushes every active buffer on the way
+     * out -- to fd 1. So the seal is a buffer that is never ended and whose
+     * callback returns nothing: the shutdown flush still runs, and still writes
+     * zero bytes. Any phase is covered, destructors and shutdown functions included.
+     *
+     * Discarding alone would trade a loud bug for a silent one: the debug echo
+     * someone left in a test, and the fatal that killed the run, would both vanish.
+     * So the same hook ships them over the socket instead, and the parent reports
+     * them as the result. The bytes that used to corrupt the channel become the
+     * diagnostic that explains the crash.
+     *
+     * This only ever fires on the crash path. A run that completes writes its
+     * payload and dies by SIGKILL in {@see terminateChild()}, which runs no
+     * shutdown function at all; the flag covers the posix-less fallback there,
+     * where exit(0) does run them.
+     *
+     * @param resource $childSock
+     */
+    private static function sealChildStdout($childSock): void
+    {
+        ob_start(static fn (string $buffer, int $phase): string => '');
+
+        register_shutdown_function(static function () use ($childSock): void {
+            if (self::$childResultSent) {
+                return;
+            }
+
+            $printed = ob_get_contents();
+            $payload = [
+                'exit_code' => 255,
+                'output'    => self::errorOutput(
+                    self::deathMessage(error_get_last()),
+                    is_string($printed) ? $printed : '',
+                ),
+            ];
+
+            @fwrite($childSock, (string) json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            @fflush($childSock);
+        });
+    }
+
+    /**
+     * Name what killed the child, when PHP recorded it.
+     *
+     * `error_get_last()` also returns warnings and notices that were survived, so
+     * only the fatal classes are quoted -- a warning from early in the run would
+     * name the wrong culprit with total confidence.
+     *
+     * @param array{type: int, message: string, file: string, line: int}|null $lastError
+     */
+    private static function deathMessage(?array $lastError): string
+    {
+        $message = 'phpunit child died before shipping a result';
+
+        $fatal = [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR];
+        if ($lastError !== null && \in_array($lastError['type'], $fatal, true)) {
+            return $message . ': ' . $lastError['message']
+                . ' in ' . $lastError['file'] . ':' . $lastError['line'];
+        }
+
+        return $message . ' (no fatal recorded -- exit(), a signal, or a crash in an extension)';
     }
 
     /**
@@ -288,10 +373,16 @@ final class PhpunitRunner
     /**
      * Build an InMemorySubscriber-shaped result JSON carrying a single error, so
      * the validator adapter renders the failure instead of choking on empty output.
+     *
+     * `$echoed` carries whatever the run printed, under the same `echo` key
+     * {@see runInProcess()} uses on the success path. It is the only route out for
+     * output produced by a run that died -- stdout is the MCP transport and the
+     * child is sealed off from it (#3) -- so a debug echo, or the error page a
+     * framework rendered on its way down, still reaches whoever reads the result.
      */
-    private function errorOutput(string $message): string
+    private static function errorOutput(string $message, string $echoed = ''): string
     {
-        return (string) json_encode([
+        $result = [
             'tests'      => 0,
             'assertions' => 0,
             'failures'   => [],
@@ -304,7 +395,13 @@ final class PhpunitRunner
             ]],
             'skipped' => [],
             'time'    => 0.0,
-        ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        ];
+
+        if ($echoed !== '') {
+            $result['echo'] = $echoed;
+        }
+
+        return (string) json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 
     private static function prewarmProbePath(): string
